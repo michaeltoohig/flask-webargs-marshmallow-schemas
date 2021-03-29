@@ -1,7 +1,8 @@
 import datetime
+import traceback
 from functools import wraps
 
-from flask import Flask, abort, jsonify
+from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_
 from marshmallow import Schema, fields, ValidationError, pre_load
@@ -13,6 +14,73 @@ from webargs.flaskparser import use_args
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
 db = SQLAlchemy(app)
+
+
+##### EXCEPTION HANDLING #####
+
+
+class APIException(Exception):
+    def __init__(self, message, status_code, payload):
+        super().__init__()
+        self.message = message
+        self.status_code = status_code
+        self.payload = payload
+
+    def to_dict(self):
+        rv = dict(self.payload or ())
+        rv["message"] = self.message
+        rv["status"] = "error"
+        return rv
+
+
+class InvalidPayload(APIException):
+    def __init__(self, message="Invalid payload.", payload=None):
+        super().__init__(message=message, status_code=400, payload=payload)
+
+
+class BusinessException(APIException):
+    def __init__(self, message="Business rule constraint not satified.", payload=None):
+        super().__init__(message=message, status_code=400, payload=payload)
+
+
+class NotFoundException(APIException):
+    def __init__(self, message="Not Found.", payload=None):
+        super().__init__(message=message, status_code=404, payload=payload)
+
+
+class ServerErrorException(APIException):
+    def __init__(self, message="Something went wrong.", payload=None):
+        super().__init__(message=message, status_code=500, payload=payload)
+
+
+@app.errorhandler(ValidationError)
+@app.errorhandler(InvalidPayload)
+@app.errorhandler(BusinessException)
+@app.errorhandler(NotFoundException)
+@app.errorhandler(ServerErrorException)
+@app.errorhandler(APIException)
+def handle_exception(error: APIException):
+    response = jsonify(error.to_dict())
+    response.status_code = error.status_code
+    return response
+
+
+@app.errorhandler(404)
+def handle_not_found(error):
+    return handle_exception(NotFoundException())
+
+
+@app.errorhandler(422)
+def handle_not_found(error, **kwargs):
+    message = error.data.get("messages").get("json")
+    return handle_exception(InvalidPayload(message=message))
+
+
+@app.errorhandler(500)
+def handle_general_exception(error):
+    app.logger.error(f"Unknown Exception: {str(error)}")
+    app.logger.debug("".join(traceback.format_exception(etype=type(error), value=error, tb=error.__traceback__)))
+    return handle_exception(ServerErrorException())
 
 
 ##### MODELS #####
@@ -48,9 +116,6 @@ class Quote(db.Model):  # type: ignore
         self.content = content
         self.author_id = author_id
         self.posted_at = posted_at
-
-
-db.create_all()
 
 
 ##### SCHEMAS #####
@@ -152,7 +217,7 @@ class CRUDQuote(CRUDBase):
 crud_quote = CRUDQuote(model=Quote)
 
 
-##### DEPENDENCIES #####
+##### DECORATORS #####
 
 
 def response_schema(schema):
@@ -173,7 +238,7 @@ def get_author_by_pk(func):
     def wrapper(pk, *args, **kwargs):
         author = crud_author.get(db, id=pk)
         if not author:
-            raise abort(404)
+            raise NotFoundException("Author Not Found")
         return func(author, *args, **kwargs)
     return wrapper
 
@@ -183,7 +248,7 @@ def get_quote_by_pk(func):
     def wrapper(pk, *args, **kwargs):
         quote = crud_quote.get(db, id=pk)
         if not quote:
-            raise abort(404)
+            raise NotFoundException("Quote Not Found")
         return func(quote, *args, **kwargs)
     return wrapper
 
