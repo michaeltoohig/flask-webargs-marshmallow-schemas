@@ -1,11 +1,13 @@
 import datetime
-from typing import Any, Generic, List, Optional, TypeVar
+from functools import wraps
 
-from flask import Flask, request
+from flask import Flask, abort, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.declarative import as_declarative, declared_attr
+from sqlalchemy import and_
 from marshmallow import Schema, fields, ValidationError, pre_load
+from webargs import fields
+from webargs.flaskparser import use_args
+
 
 # configure app
 app = Flask(__name__)
@@ -13,31 +15,42 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
 db = SQLAlchemy(app)
 
 
-@as_declarative()
-class Base:
-    id: Any
-    __name__: str
-    # Generate __tablename__ automatically
-    @declared_attr
-    def __tablename__(cls) -> str:
-        return cls.__name__.lower()
-
-
 ##### MODELS #####
 
 
-class Author(Base):  # type: ignore
+class Author(db.Model):  # type: ignore
     id = db.Column(db.Integer, primary_key=True)
     first = db.Column(db.String(80))
     last = db.Column(db.String(80))
 
+    def __init__(
+        self,
+        first: str,
+        last: str,
+    ):
+        self.first = first
+        self.last = last
 
-class Quote(Base):  # type: ignore
+
+class Quote(db.Model):  # type: ignore
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String, nullable=False)
     author_id = db.Column(db.Integer, db.ForeignKey("author.id"))
     author = db.relationship("Author", backref=db.backref("quotes", lazy="dynamic"))
     posted_at = db.Column(db.DateTime)
+
+    def __init__(
+        self,
+        content: str,
+        author_id: int,
+        posted_at: datetime = datetime.datetime.utcnow()
+    ):
+        self.content = content
+        self.author_id = author_id
+        self.posted_at = posted_at
+
+
+db.create_all()
 
 
 ##### SCHEMAS #####
@@ -88,28 +101,18 @@ quotes_schema = QuoteSchema(many=True, only=("id", "content"))
 ##### CRUD #####
 
 
-# ModelType = TypeVar("ModelType", bound=Base)
-# SchemaType = TypeVar("SchemaType", bound=Schema)
-# UpdateSchemaType = TypeVar("UpdateSchemaType", bound=Schema)
-
-
 class CRUDBase:
-    def __init__(self, model, schema):
+    def __init__(self, model):
         self.model = model
-        self.single_schema = schema()
-        self.many_schema = schema(many=True)
 
     def get(self, db, id: int):
-        result = db.session.query(self.model).filter(self.model.id == id).first()
-        return self.single_schema.dump(result)
+        return db.session.query(self.model).filter(self.model.id == id).first()
 
     def get_multi(self, db, skip: int = 0, limit: int = 5):
-        results = db.session.query(self.model).offset(skip).limit(limit).all()
-        return self.many_schema.dump(results)
+        return db.session.query(self.model).offset(skip).limit(limit).all()
 
     def create(self, db, obj_in):
-        obj_in_data = self.single_schema.dump(obj_in)
-        db_obj = self.model(**obj_in_data)  # type: ignore
+        db_obj = self.model(**obj_in)  # type: ignore
         db.session.add(db_obj)
         db.session.commit()
         db.session.refresh(db_obj)
@@ -117,98 +120,118 @@ class CRUDBase:
 
 
 class CRUDAuthor(CRUDBase):
-    pass
+    def get_by_name(self, db, first: str, last: str):
+        return (
+            db.session.query(self.model)
+            .filter(and_(self.model.first == first, self.model.last == last))
+            .first()
+        )
 
 
-crud_author = CRUDAuthor(model=Author, schema=AuthorSchema)
+crud_author = CRUDAuthor(model=Author)
 
 
 class CRUDQuote(CRUDBase):
     def get_multi_by_author(self, db, author_id: int, skip: int = 0, limit: int = 5):
-        results = (
+        return (
             db.session.query(self.model)
             .filter(self.model.author_id == author_id)
             .offset(skip)
             .limit(limit)
             .all()
         )
-        return self.many_schema.dump(results)
+
+    def create(self, db, obj_in, author: Author):
+        db_obj = self.model(**obj_in, author_id=author.id)  # type: ignore
+        db.session.add(db_obj)
+        db.session.commit()
+        db.session.refresh(db_obj)
+        return db_obj
 
 
-crud_quote = CRUDQuote(model=Quote, schema=QuoteSchema)
+crud_quote = CRUDQuote(model=Quote)
+
+
+##### DEPENDENCIES #####
+
+
+def response_schema(schema):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            response = f(*args, **kwargs)
+            data = schema.dump(response)
+            if isinstance(data, list):
+                return jsonify(data)
+            return data
+        return decorated_function
+    return decorator
+ 
+
+def get_author_by_pk(func):
+    @wraps(func)
+    def wrapper(pk, *args, **kwargs):
+        author = crud_author.get(db, id=pk)
+        if not author:
+            raise abort(404)
+        return func(author, *args, **kwargs)
+    return wrapper
+
+
+def get_quote_by_pk(func):
+    @wraps(func)
+    def wrapper(pk, *args, **kwargs):
+        quote = crud_quote.get(db, id=pk)
+        if not quote:
+            raise abort(404)
+        return func(quote, *args, **kwargs)
+    return wrapper
 
 
 #### API #####
 
 
 @app.route("/authors")
+@response_schema(authors_schema)
 def get_authors():
-    # authors = Author.query.all()
-    # # Serialize the queryset
-    # result = authors_schema.dump(authors)
-    result = crud_author.get_multi(db)
-    return {"authors": result}
+    authors = crud_author.get_multi(db)
+    return authors
 
 
 @app.route("/authors/<int:pk>")
-def get_author(pk):
-    # try:
-    #     author = Author.query.get(pk)
-    # except IntegrityError:
-    #     return {"message": "Author could not be found."}, 400
-    # author_result = author_schema.dump(author)
-    # quotes_result = quotes_schema.dump(author.quotes.all())
-    author = crud_author.get(db, id=pk)
-    if not author:
-        raise Exception  # some HTTP error
-    quotes = crud_quote.get_multi_by_author(db, author_id=pk)
-    return {"author": author, "quotes": quotes}
+@get_author_by_pk
+@response_schema(author_schema)
+def get_author(author):
+    return author
 
 
 @app.route("/quotes/", methods=["GET"])
+@response_schema(quotes_schema)
 def get_quotes():
-    # quotes = Quote.query.all()
-    # result = quotes_schema.dump(quotes, many=True)
     quotes = crud_quote.get_multi(db)
-    return {"quotes": quotes}
+    return quotes
 
 
 @app.route("/quotes/<int:pk>")
-def get_quote(pk):
-    # try:
-    #     quote = Quote.query.get(pk)
-    # except IntegrityError:
-    #     return {"message": "Quote could not be found."}, 400
-    # result = quote_schema.dump(quote)
-    quote = crud_quote.get(db, id=pk)
-    return {"quote": quote}
+@get_quote_by_pk
+@response_schema(quote_schema)
+def get_quote(quote):
+    return quote
 
 
 @app.route("/quotes/", methods=["POST"])
-def new_quote():
-    json_data = request.get_json()
-    if not json_data:
-        return {"message": "No input data provided"}, 400
-    # # Validate and deserialize input
-    # try:
-    #     data = quote_schema.load(json_data)
-    # except ValidationError as err:
-    #     return err.messages, 422
-    # first, last = data["author"]["first"], data["author"]["last"]
-    # author = Author.query.filter_by(first=first, last=last).first()
-    # if author is None:
-    #     # Create a new author
-    #     author = Author(first=first, last=last)
-    #     db.session.add(author)
-    # # Create new quote
-    # quote = Quote(
-    #     content=data["content"], author=author, posted_at=datetime.datetime.utcnow()
-    # )
-    # db.session.add(quote)
-    # db.session.commit()
-    # result = quote_schema.dump(Quote.query.get(quote.id))
-    
-    return {"message": "Created new quote.", "quote": result}
+@response_schema(quote_schema)
+@use_args(quote_schema)
+def new_quote(args):
+    first, last = args["author"]["first"], args["author"]["last"]
+    author = crud_author.get_by_name(db, first=first, last=last)
+    if author is None:
+        # Create a new author
+        author = crud_author.create(db, obj_in=args["author"])
+    # Create new quote
+    del args["author"]
+    quote = crud_quote.create(db, obj_in=args, author=author)
+    return quote
 
 
 if __name__ == "__main__":
